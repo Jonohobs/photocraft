@@ -753,3 +753,40 @@ fn batch_plays_a_photoshop_actions_file() {
     assert!(err.contains("Generative Fill"), "{err}");
     assert!(!o.status.success());
 }
+
+#[test]
+fn mcp_commands_allowlist_cli_validations() {
+    let d = tmp("mcp-allowlist");
+
+    // Missing file
+    let missing = d.join("does_not_exist.txt");
+    let o = bin().args(["mcp", "--commands"]).arg(&missing).output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("does_not_exist.txt"), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+
+    // Empty file
+    let empty = d.join("empty.txt");
+    std::fs::write(&empty, "# only comments\n   \n").unwrap();
+    let o = bin().args(["mcp", "--commands"]).arg(&empty).output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("empty"), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+
+    // Malformed glob file
+    let malformed = d.join("bad.txt");
+    std::fs::write(&malformed, "layer.*.blur\n").unwrap();
+    let o = bin().args(["mcp", "--commands"]).arg(&malformed).output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("layer.*.blur") && err.contains("only a trailing `*` glob is supported"), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+
+    // Usage help names --commands
+    let (out, _) = ok(bin().args(["mcp", "--help"]));
+    assert!(out.contains("--commands <file>"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&d);
+}
