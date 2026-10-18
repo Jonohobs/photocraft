@@ -10,12 +10,28 @@ Paths are relative to the corresponding root, or absolute paths beneath it; with
 filesystem authority is absent. Bridge mode uses `--bridge` and `--control-token-file` as
 described in [development.md](development.md). UI tools require a running desktop app.
 
+The engine command catalog can be restricted with `--commands <file>`:
+
+```sh
+photocraft-cli mcp --commands /path/to/commands.allowlist
+```
+
+The allowlist file specifies one command id (e.g. `file.new`) or prefix glob with a trailing `*`
+(e.g. `layer.*`) per line. Blank lines and `#` comments are ignored, and surrounding whitespace is
+trimmed. Only trailing `*` globs are supported (e.g. `layer.*` matches `layer.new`, not `layers.x`);
+any other use of `*` is an error naming the offending line. An unreadable, empty or malformed file
+causes the CLI to exit with an error before serving. When active, only allowed commands appear in
+`command_list` and the `photocraft://commands` resource. Invoking an excluded command via
+`command_run` returns a tool error naming the id and `--commands`; in `command_batch`, execution
+refuses at the offending step with the same error, preserving earlier successful steps per existing
+batch semantics.
+
 ## Tools and resources
 
 - `command_list`: discover engine ids, parameter docs and current enabled state; accepts
   `filter` and `enabled_only`. Returns a bare JSON array of
   `{id, label, menu, shortcut, params, enabled, disabledReason, needsDocument}` objects (see
-  [Command list replies](control-protocol.md#command-list-replies)).
+  [Command list replies](control-protocol.md#command-list-replies); narrowed by `--commands` when configured).
 - `command_run`: `id`, optional `params` and `wait`. Command parameters remain engine-defined.
 - `command_batch`: ordered `steps`, optional `stop_on_error` (default true); stops at the first
   error unless false. Not an atomic transaction: earlier successful steps stay applied, with
