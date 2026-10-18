@@ -182,6 +182,145 @@ async fn command_list_filters() {
     client.cancel().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn command_allowlist_enforcement() {
+    let allowlist_text = "
+        # Allowed commands
+        file.new
+        layer.*
+    ";
+    let allowlist = photocraft_automation::CommandAllowlist::parse(allowlist_text).unwrap();
+    let client = connect(PhotocraftMcp::headless().with_allowlist(allowlist)).await;
+
+    // 1. List narrowed: only allowed commands appear
+    let all = json_of(&call(&client, "command_list", json!({})).await);
+    let items = all.as_array().unwrap();
+    assert!(!items.is_empty());
+    for item in items {
+        let id = item["id"].as_str().unwrap();
+        assert!(id == "file.new" || id.starts_with("layer."), "unexpected command {id}");
+    }
+    assert!(items.iter().any(|c| c["id"] == "file.new"));
+    assert!(items.iter().any(|c| c["id"] == "layer.new.layer"));
+    assert!(!items.iter().any(|c| c["id"] == "edit.undo"));
+    assert!(!items.iter().any(|c| c["id"] == "filter.blur.gaussianBlur"));
+
+    // 2. Resource narrowed: photocraft://commands matches command_list
+    let r = client.read_resource(rmcp::model::ReadResourceRequestParams::new("photocraft://commands")).await.unwrap();
+    let v = serde_json::to_value(r).unwrap();
+    let resource_commands: Value = serde_json::from_str(v["contents"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(&resource_commands, &all);
+
+    // 3. Run refused with named error
+    let res = call(&client, "command_run", json!({"id": "edit.undo", "params": {}})).await;
+    assert_eq!(res.is_error, Some(true));
+    let err_msg = text(&res);
+    assert!(err_msg.contains("edit.undo") && err_msg.contains("--commands"), "{err_msg}");
+
+    // Allowed command runs
+    json_of(&call(&client, "doc_new", json!({"width": 32, "height": 32})).await);
+    let run_ok = call(&client, "command_run", json!({"id": "layer.new.layer", "params": {"name": "TestLayer"}})).await;
+    assert_ne!(run_ok.is_error, Some(true));
+
+    // 4. Batch refused at step: earlier results kept, offending step refused, later skipped
+    let batch_res = json_of(
+        &call(
+            &client,
+            "command_batch",
+            json!({"steps": [
+                {"id": "layer.new.layer", "params": {"name": "BatchOne"}},
+                {"id": "edit.undo", "params": {}},
+                {"id": "layer.new.layer", "params": {"name": "BatchThree"}}
+            ]}),
+        )
+        .await,
+    );
+    assert_eq!(batch_res["completed"], 1, "{batch_res}");
+    assert_eq!(batch_res["failed"], 1, "{batch_res}");
+    assert_eq!(batch_res["results"].as_array().unwrap().len(), 2);
+    assert_eq!(batch_res["results"][0]["ok"], true);
+    assert_eq!(batch_res["results"][1]["ok"], false);
+    let step_err = batch_res["results"][1]["error"].as_str().unwrap();
+    assert!(step_err.contains("edit.undo") && step_err.contains("--commands"), "{step_err}");
+
+    // Verify document kept BatchOne and did NOT run BatchThree
+    let doc = json_of(&call(&client, "doc_inspect", json!({})).await).to_string();
+    assert!(doc.contains("\"BatchOne\"") && !doc.contains("\"BatchThree\""));
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_command_allowlist_enforcement() {
+    let (addr, app) = fake_app().await;
+    let allowlist = photocraft_automation::CommandAllowlist::parse("layer.*\nfile.new").unwrap();
+    let client = connect(PhotocraftMcp::bridge(&addr, CONTROL_TOKEN).unwrap().with_allowlist(allowlist)).await;
+
+    // Run refused with named error
+    let res = call(&client, "command_run", json!({"id": "edit.undo", "params": {}})).await;
+    assert_eq!(res.is_error, Some(true));
+    let err_msg = text(&res);
+    assert!(err_msg.contains("edit.undo") && err_msg.contains("--commands"), "{err_msg}");
+
+    // Batch refused at step
+    let batch_res = json_of(
+        &call(
+            &client,
+            "command_batch",
+            json!({"steps": [
+                {"id": "layer.new.layer"},
+                {"id": "edit.undo"},
+                {"id": "layer.duplicate"}
+            ]}),
+        )
+        .await,
+    );
+    assert_eq!(batch_res["completed"], 1, "{batch_res}");
+    assert_eq!(batch_res["failed"], 1, "{batch_res}");
+    assert_eq!(batch_res["results"][0]["ok"], true);
+    assert_eq!(batch_res["results"][1]["ok"], false);
+    let step_err = batch_res["results"][1]["error"].as_str().unwrap();
+    assert!(step_err.contains("edit.undo") && step_err.contains("--commands"), "{step_err}");
+
+    client.cancel().await.unwrap();
+    app.abort();
+}
+
+#[test]
+fn command_allowlist_glob_and_file_parsing() {
+    // Glob semantics: layer.* matches layer.new, not layers.x
+    let al = photocraft_automation::CommandAllowlist::parse("layer.*").unwrap();
+    assert!(al.allows("layer.new"));
+    assert!(al.allows("layer.new.layer"));
+    assert!(!al.allows("layers.x"));
+    assert!(!al.allows("layer"));
+
+    // Comments and blank lines
+    let text = "
+        # comment
+        
+           # indented comment
+        edit.cut   
+        
+        filter.*
+    ";
+    let al = photocraft_automation::CommandAllowlist::parse(text).unwrap();
+    assert!(al.allows("edit.cut"));
+    assert!(al.allows("filter.blur.gaussianBlur"));
+    assert!(!al.allows("edit.copy"));
+
+    // Malformed file errors naming the line
+    for bad in ["*foo", "layer.*.blur", "foo*bar", "**", "layer.*.*"] {
+        let err = photocraft_automation::CommandAllowlist::parse(bad).unwrap_err();
+        assert!(err.contains(bad), "expected error to name {bad}, got: {err}");
+        assert!(err.contains("only a trailing `*` glob is supported"), "{err}");
+    }
+
+    // Empty file error
+    let err = photocraft_automation::CommandAllowlist::parse("   \n# only comments\n   ").unwrap_err();
+    assert!(err.contains("empty"), "{err}");
+}
+
 /// Constructs strict tool-schema validators reject: a `$ref` / `$defs`, or a boolean in a schema
 /// position (`items: true`), anywhere in `schema`.
 fn strict_schema_problems(path: &str, schema: &Value, out: &mut Vec<String>) {

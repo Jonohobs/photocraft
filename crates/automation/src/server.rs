@@ -13,6 +13,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::allowlist::CommandAllowlist;
 use crate::bridge::BridgeClient;
 use crate::budgets::{BatchReplyBudget, MAX_PREVIEW_SIDE, check_png, json_bytes};
 use crate::headless::Headless;
@@ -31,6 +32,7 @@ pub enum Backend {
 pub struct PhotocraftMcp {
     backend: Arc<Backend>,
     tool_router: ToolRouter<Self>,
+    allowlist: Option<Arc<CommandAllowlist>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -477,7 +479,24 @@ impl PhotocraftMcp {
             strict_schema(&mut schema);
             route.attr.input_schema = Arc::new(schema);
         }
-        PhotocraftMcp { backend: Arc::new(backend), tool_router }
+        PhotocraftMcp { backend: Arc::new(backend), tool_router, allowlist: None }
+    }
+
+    /// Constrain exposed commands with an allowlist.
+    pub fn with_allowlist(mut self, allowlist: CommandAllowlist) -> Self {
+        self.allowlist = Some(Arc::new(allowlist));
+        self
+    }
+
+    pub fn allowlist(&self) -> Option<&CommandAllowlist> {
+        self.allowlist.as_deref()
+    }
+
+    pub fn is_command_allowed(&self, id: &str) -> bool {
+        match &self.allowlist {
+            Some(allowlist) => allowlist.allows(id),
+            None => true,
+        }
     }
 
     /// Serve MCP over stdin/stdout until the client disconnects.
@@ -826,7 +845,9 @@ impl PhotocraftMcp {
             .unwrap_or_else(|| all.get("commands").and_then(Value::as_array).cloned().unwrap_or_default())
             .into_iter()
             .filter(|c| {
-                needle.as_ref().is_none_or(|n| photocraft_engine::commands::list_entry_matches(c, n))
+                let id = c.get("id").and_then(Value::as_str).unwrap_or_default();
+                self.is_command_allowed(id)
+                    && needle.as_ref().is_none_or(|n| photocraft_engine::commands::list_entry_matches(c, n))
                     && (!enabled_only || c.get("enabled").and_then(Value::as_bool).unwrap_or(true))
             })
             .collect();
@@ -864,7 +885,50 @@ impl PhotocraftMcp {
             p.steps.into_iter().map(|s| json!({"command": s.id, "params": s.params.unwrap_or_else(|| json!({})), "wait": s.wait.unwrap_or(true)})).collect();
         let args = json!({"steps": steps, "stopOnError": stop});
         // The reply travels as escaped JSON text, so steps are charged their escaped size.
-        if let Some(r) = self.headless_op(move |h| h.batch_with_budget(&args, BatchReplyBudget::escaped())).await {
+        let allowlist = self.allowlist.clone();
+        let headless_steps = steps.clone();
+        if let Some(r) = self
+            .headless_op(move |h| {
+                if let Some(al) = allowlist {
+                    let mut results = Vec::with_capacity(headless_steps.len());
+                    let mut failed = 0usize;
+                    let mut reply_budget = BatchReplyBudget::escaped();
+                    for s in &headless_steps {
+                        let cmd_id = s.get("command").and_then(Value::as_str).unwrap_or_default();
+                        let was_error;
+                        let result = if !al.allows(cmd_id) {
+                            was_error = true;
+                            json!({"ok": false, "error": format!("command `{cmd_id}` is not allowed by `--commands`")})
+                        } else {
+                            let params = s.get("params").cloned().unwrap_or(Value::Null);
+                            let wait = s.get("wait").and_then(Value::as_bool).unwrap_or(true);
+                            let r = h.command_start(cmd_id, params, wait);
+                            was_error = r.is_err();
+                            match r {
+                                Ok(v) => json!({"ok": true, "result": v}),
+                                Err(e) => json!({"ok": false, "error": e.to_string()}),
+                            }
+                        };
+                        if let Err(error) = reply_budget.charge(&result) {
+                            failed += 1;
+                            results.push(json!({"ok": false, "error": format!("batch response budget exceeded; current step may have completed: {error}")}));
+                            break;
+                        }
+                        results.push(result);
+                        if was_error {
+                            failed += 1;
+                            if stop {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(json!({"completed": results.len() - failed, "failed": failed, "results": results}))
+                } else {
+                    h.batch_with_budget(&args, BatchReplyBudget::escaped())
+                }
+            })
+            .await
+        {
             return to_result(r);
         }
         let Some(b) = self.bridge_client() else {
@@ -874,11 +938,17 @@ impl PhotocraftMcp {
         let mut failed = 0;
         let mut reply_budget = BatchReplyBudget::escaped();
         for s in &steps {
-            let response = b.call("engine.execute", s.clone()).await;
-            let was_error = response.is_err();
-            let result = match response {
-                Ok(value) => json!({"ok": true, "result": value}),
-                Err(error) => json!({"ok": false, "error": error.to_string()}),
+            let cmd_id = s.get("command").and_then(Value::as_str).unwrap_or_default();
+            let (was_error, result) = if !self.is_command_allowed(cmd_id) {
+                (true, json!({"ok": false, "error": format!("command `{cmd_id}` is not allowed by `--commands`")}))
+            } else {
+                let response = b.call("engine.execute", s.clone()).await;
+                let was_err = response.is_err();
+                let res = match response {
+                    Ok(value) => json!({"ok": true, "result": value}),
+                    Err(error) => json!({"ok": false, "error": error.to_string()}),
+                };
+                (was_err, res)
             };
             if let Err(error) = reply_budget.charge(&result) {
                 failed += 1;
@@ -968,6 +1038,9 @@ fn bridge_only_headless(name: &str) -> Result<CallToolResult, McpError> {
 
 impl PhotocraftMcp {
     async fn run_command(&self, id: String, params: Value, wait: bool) -> Result<CallToolResult, McpError> {
+        if !self.is_command_allowed(&id) {
+            return Ok(fail(format!("command `{id}` is not allowed by `--commands`")));
+        }
         let (id2, params2) = (id.clone(), params.clone());
         if let Some(r) = self.headless_op(move |h| h.command_start(&id2, params2, wait)).await {
             return to_result(r);
