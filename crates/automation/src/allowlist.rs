@@ -2,6 +2,9 @@
 
 use std::path::Path;
 
+/// Largest allowlist file `load` reads.
+pub const MAX_ALLOWLIST_BYTES: usize = 1 << 20;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AllowPattern {
     Exact(String),
@@ -28,6 +31,12 @@ impl CommandAllowlist {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            if line.contains('#') {
+                return Err(format!("invalid pattern `{line}`: `#` starts a comment only at the start of a line"));
+            }
+            if line == "*" {
+                return Err("invalid pattern `*`: a bare `*` allows every command; omit `--commands` instead".to_string());
+            }
             if line.contains('*') {
                 let Some(prefix) = line.strip_suffix('*') else {
                     return Err(format!("invalid pattern `{line}`: only a trailing `*` glob is supported"));
@@ -48,7 +57,15 @@ impl CommandAllowlist {
 
     /// Load and parse an allowlist from a file path.
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        use std::io::Read;
+        let name = path.display();
+        let file = std::fs::File::open(path).map_err(|e| format!("{name}: {e}"))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_ALLOWLIST_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(|e| format!("{name}: {e}"))?;
+        if bytes.len() > MAX_ALLOWLIST_BYTES {
+            return Err(format!("{name}: allowlist exceeds {MAX_ALLOWLIST_BYTES} bytes"));
+        }
+        let text = String::from_utf8(bytes).map_err(|_| format!("{name}: not valid UTF-8"))?;
         Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
 
@@ -84,6 +101,21 @@ mod tests {
     fn parse_rejects_empty() {
         assert!(CommandAllowlist::parse("").is_err());
         assert!(CommandAllowlist::parse("   \n# only comments\n   ").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_bare_star_and_inline_comment() {
+        assert!(CommandAllowlist::parse("*").unwrap_err().contains("bare `*`"));
+        assert!(CommandAllowlist::parse("file.new # note").unwrap_err().contains("file.new # note"));
+    }
+
+    #[test]
+    fn load_rejects_oversized_file() {
+        let path = std::env::temp_dir().join(format!("pc-allow-big-{}.txt", std::process::id()));
+        std::fs::write(&path, "a".repeat(MAX_ALLOWLIST_BYTES + 1)).unwrap();
+        let err = CommandAllowlist::load(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("exceeds"), "{err}");
     }
 
     #[test]

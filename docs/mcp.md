@@ -26,6 +26,16 @@ causes the CLI to exit with an error before serving. When active, only allowed c
 refuses at the offending step with the same error, preserving earlier successful steps per existing
 batch semantics.
 
+The allowlist is a **discovery and run filter for the command tools, not a security boundary**:
+
+- It gates `command_list`, `command_run`, `command_batch` and the `photocraft://commands` resource.
+- Typed tools (`doc_new`, `doc_place`, `doc_export_layers`, the data-set tools, ...) and the job
+  tools `jobs_list` / `jobs_cancel` are not gated, so `doc_new` works without `file.new` listed.
+- In bridge mode `control_call` (including `engine.execute` and `engine.commands`) and
+  `ui_menu_invoke` can still run any command.
+- A bare `*` is rejected (omit the flag to allow everything), `#` is a comment only at the start of
+  a line, and the file is limited to 1 MiB.
+
 ## Tools and resources
 
 - `command_list`: discover engine ids, parameter docs and current enabled state; accepts

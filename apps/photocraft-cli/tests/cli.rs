@@ -627,6 +627,42 @@ fn mcp_stdio_handshake_and_tool_call() {
     let _ = child.wait();
 }
 
+/// `mcp --commands <file>` reaches the server: `command_run` refuses ids outside the list.
+#[test]
+fn mcp_commands_flag_narrows_the_served_catalog() {
+    let d = tmp("mcp-allowlist-serve");
+    let list = d.join("list.txt");
+    std::fs::write(&list, "layer.*\n").unwrap();
+    let mut child = bin().arg("mcp").arg("--commands").arg(&list).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut send = |v: Value| {
+        writeln!(stdin, "{v}").unwrap();
+        stdin.flush().unwrap();
+    };
+    let mut recv = |id: u64| -> Value {
+        loop {
+            let mut line = String::new();
+            assert!(stdout.read_line(&mut line).unwrap() > 0, "server closed");
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v["id"] == id {
+                return v;
+            }
+        }
+    };
+    send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}));
+    recv(1);
+    send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"command_run","arguments":{"id":"edit.undo"}}}));
+    let r = recv(2);
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert!(r["result"]["content"][0]["text"].as_str().unwrap_or_default().contains("--commands"), "{r}");
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// `--format` mapping two inputs to one name fails the second instead of overwriting the first (#420).
 #[test]
 fn batch_fails_inputs_that_share_an_output_name() {

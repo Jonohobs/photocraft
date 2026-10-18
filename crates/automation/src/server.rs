@@ -858,6 +858,9 @@ impl PhotocraftMcp {
         Long commands (filters, Content-Aware Fill/Scale, Photomerge, brush import) wait to finish unless `wait` is false: \
         then they run as a background job and the result is {job: id} (see jobs_list, jobs_cancel).")]
     async fn command_run(&self, Parameters(p): Parameters<RunParams>) -> Result<CallToolResult, McpError> {
+        if !self.is_command_allowed(&p.id) {
+            return Ok(fail(format!("command `{}` is not allowed by `--commands`", p.id)));
+        }
         self.run_command(p.id, p.params.unwrap_or_else(|| json!({})), p.wait.unwrap_or(true)).await
     }
 
@@ -886,48 +889,8 @@ impl PhotocraftMcp {
         let args = json!({"steps": steps, "stopOnError": stop});
         // The reply travels as escaped JSON text, so steps are charged their escaped size.
         let allowlist = self.allowlist.clone();
-        let headless_steps = steps.clone();
-        if let Some(r) = self
-            .headless_op(move |h| {
-                if let Some(al) = allowlist {
-                    let mut results = Vec::with_capacity(headless_steps.len());
-                    let mut failed = 0usize;
-                    let mut reply_budget = BatchReplyBudget::escaped();
-                    for s in &headless_steps {
-                        let cmd_id = s.get("command").and_then(Value::as_str).unwrap_or_default();
-                        let was_error;
-                        let result = if !al.allows(cmd_id) {
-                            was_error = true;
-                            json!({"ok": false, "error": format!("command `{cmd_id}` is not allowed by `--commands`")})
-                        } else {
-                            let params = s.get("params").cloned().unwrap_or(Value::Null);
-                            let wait = s.get("wait").and_then(Value::as_bool).unwrap_or(true);
-                            let r = h.command_start(cmd_id, params, wait);
-                            was_error = r.is_err();
-                            match r {
-                                Ok(v) => json!({"ok": true, "result": v}),
-                                Err(e) => json!({"ok": false, "error": e.to_string()}),
-                            }
-                        };
-                        if let Err(error) = reply_budget.charge(&result) {
-                            failed += 1;
-                            results.push(json!({"ok": false, "error": format!("batch response budget exceeded; current step may have completed: {error}")}));
-                            break;
-                        }
-                        results.push(result);
-                        if was_error {
-                            failed += 1;
-                            if stop {
-                                break;
-                            }
-                        }
-                    }
-                    Ok(json!({"completed": results.len() - failed, "failed": failed, "results": results}))
-                } else {
-                    h.batch_with_budget(&args, BatchReplyBudget::escaped())
-                }
-            })
-            .await
+        if let Some(r) =
+            self.headless_op(move |h| h.batch_filtered(&args, BatchReplyBudget::escaped(), &|id| allowlist.as_ref().is_none_or(|al| al.allows(id)))).await
         {
             return to_result(r);
         }
@@ -1038,9 +1001,6 @@ fn bridge_only_headless(name: &str) -> Result<CallToolResult, McpError> {
 
 impl PhotocraftMcp {
     async fn run_command(&self, id: String, params: Value, wait: bool) -> Result<CallToolResult, McpError> {
-        if !self.is_command_allowed(&id) {
-            return Ok(fail(format!("command `{id}` is not allowed by `--commands`")));
-        }
         let (id2, params2) = (id.clone(), params.clone());
         if let Some(r) = self.headless_op(move |h| h.command_start(&id2, params2, wait)).await {
             return to_result(r);

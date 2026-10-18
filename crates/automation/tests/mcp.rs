@@ -251,6 +251,48 @@ async fn command_allowlist_enforcement() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn command_allowlist_leaves_typed_tools_and_jobs_alone() {
+    let unfiltered = {
+        let client = connect(PhotocraftMcp::headless()).await;
+        let v = json_of(&call(&client, "command_list", json!({})).await);
+        client.cancel().await.unwrap();
+        v
+    };
+    let allowlist = photocraft_automation::CommandAllowlist::parse("layer.*").unwrap();
+    let client = connect(PhotocraftMcp::headless().with_allowlist(allowlist)).await;
+
+    // Typed tools are not gated, even though `file.new` is not allowlisted.
+    let r = call(&client, "doc_new", json!({"width": 16, "height": 16})).await;
+    assert_ne!(r.is_error, Some(true), "{}", text(&r));
+    let r = call(&client, "command_run", json!({"id": "file.new", "params": {}})).await;
+    assert_eq!(r.is_error, Some(true));
+    // Job control tools are always available.
+    assert_ne!(call(&client, "jobs_list", json!({})).await.is_error, Some(true));
+
+    // stop_on_error: false continues past a denied step.
+    let b = json_of(
+        &call(
+            &client,
+            "command_batch",
+            json!({"stop_on_error": false, "steps": [
+                {"id": "edit.undo"},
+                {"id": "layer.new.layer", "params": {"name": "After"}}
+            ]}),
+        )
+        .await,
+    );
+    assert_eq!((b["completed"].as_u64(), b["failed"].as_u64()), (Some(1), Some(1)), "{b}");
+    assert_eq!(b["results"].as_array().map(Vec::len), Some(2), "{b}");
+    assert_eq!(b["results"][1]["ok"], true);
+    client.cancel().await.unwrap();
+
+    // No allowlist: the full catalog, identical to a second unfiltered server.
+    let client = connect(PhotocraftMcp::headless()).await;
+    assert_eq!(json_of(&call(&client, "command_list", json!({})).await), unfiltered);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn bridge_command_allowlist_enforcement() {
     let (addr, app) = fake_app().await;
     let allowlist = photocraft_automation::CommandAllowlist::parse("layer.*\nfile.new").unwrap();
