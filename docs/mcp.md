@@ -33,6 +33,8 @@ The allowlist is a **discovery and run filter for the command tools, not a secur
   tools `jobs_list` / `jobs_cancel` are not gated, so `doc_new` works without `file.new` listed.
 - In bridge mode `control_call` (including `engine.execute` and `engine.commands`) and
   `ui_menu_invoke` can still run any command.
+- Allowed commands that run other commands are not inspected: allowing `actions.*` lets
+  `actions.play` replay any recorded command, and allowing `command.list` returns the full catalog.
 - A bare `*` is rejected (omit the flag to allow everything), `#` is a comment only at the start of
   a line, and the file is limited to 1 MiB.
 

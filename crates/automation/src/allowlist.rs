@@ -26,6 +26,8 @@ impl CommandAllowlist {
     /// error naming the line. An empty rule list is rejected.
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut patterns = Vec::new();
+        // Editors on Windows often save a UTF-8 BOM; it must not end up inside the first rule.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         for raw_line in text.lines() {
             let line = raw_line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -100,6 +102,13 @@ mod tests {
         assert!(al.allows("layer.new.layer"));
         assert!(al.allows("layer.duplicate"));
         assert!(!al.allows("layers.x"));
+    }
+
+    #[test]
+    fn parse_ignores_a_leading_bom() {
+        assert!(CommandAllowlist::parse("\u{feff}layer.*\n").unwrap().allows("layer.new"));
+        assert!(CommandAllowlist::parse("\u{feff}# note\nfile.new").unwrap().allows("file.new"));
+        assert!(CommandAllowlist::parse("\u{feff}").is_err());
     }
 
     #[test]
