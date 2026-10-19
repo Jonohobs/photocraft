@@ -31,8 +31,11 @@ The allowlist is a **discovery and run filter for the command tools, not a secur
 - It gates `command_list`, `command_run`, `command_batch` and the `photocraft://commands` resource.
 - Typed tools (`doc_new`, `doc_place`, `doc_export_layers`, the data-set tools, ...) and the job
   tools `jobs_list` / `jobs_cancel` are not gated, so `doc_new` works without `file.new` listed.
-- In bridge mode `control_call` (including `engine.execute` and `engine.commands`) and
-  `ui_menu_invoke` can still run any command.
+- In bridge mode it also gates the command-carrying parts of `control_call` and `ui_menu_invoke`:
+  `engine.execute`, `ui.menu.invoke`, a `command` dialog from `ui.dialog.open` and the steps of
+  a `batch` are refused for an excluded id (the app is not called), and `engine.commands` is
+  narrowed like `command_list`. Raw UI input (`ui.key`, `ui.pointer`, `ui.click`, answering
+  dialogs) is not mapped to command ids and is not gated.
 - Allowed commands that run other commands are not inspected: allowing `actions.*` lets
   `actions.play` replay any recorded command, and allowing `command.list` returns the full catalog.
 - A bare `*` is rejected (omit the flag to allow everything), `#` is a comment only at the start of

@@ -328,6 +328,122 @@ async fn bridge_command_allowlist_enforcement() {
     app.abort();
 }
 
+/// Requests the fake bridge saw, minus the `auth` handshake, once the client has disconnected.
+async fn bridge_requests_seen(client: RunningService<RoleClient, Client>, app: tokio::task::JoinHandle<Vec<Value>>) -> Vec<Value> {
+    client.cancel().await.unwrap();
+    let seen = tokio::time::timeout(std::time::Duration::from_secs(5), app).await.unwrap().unwrap();
+    seen.into_iter().filter(|request| request["method"] != "auth").collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_control_call_engine_execute_respects_allowlist() {
+    let (addr, app) = fake_app().await;
+    let allowlist = photocraft_automation::CommandAllowlist::parse("layer.*\nfile.new").unwrap();
+    let client = connect(PhotocraftMcp::bridge(&addr, CONTROL_TOKEN).unwrap().with_allowlist(allowlist)).await;
+
+    // An excluded id is refused with the shared refusal text, by `command` or by the `id` fallback.
+    for params in [json!({"command": "edit.undo"}), json!({"id": "edit.undo"}), json!({"command": 7, "id": "edit.undo"})] {
+        let res = call(&client, "control_call", json!({"method": "engine.execute", "params": params})).await;
+        assert_eq!(res.is_error, Some(true), "{params}");
+        let msg = text(&res);
+        assert_eq!(msg, photocraft_automation::allowlist::refusal("edit.undo"), "{params}");
+    }
+
+    // An allowed id passes through.
+    let res = json_of(&call(&client, "control_call", json!({"method": "engine.execute", "params": {"command": "layer.new.layer"}})).await);
+    assert_eq!(res["ran"], "layer.new.layer");
+
+    let seen = bridge_requests_seen(client, app).await;
+    assert_eq!(seen.len(), 1, "refused calls must not reach the bridge: {seen:?}");
+    assert_eq!(seen[0]["params"]["command"], "layer.new.layer");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_control_call_engine_commands_is_narrowed() {
+    let (addr, app) = fake_app().await;
+    let allowlist = photocraft_automation::CommandAllowlist::parse("layer.*\nfile.new").unwrap();
+    let client = connect(PhotocraftMcp::bridge(&addr, CONTROL_TOKEN).unwrap().with_allowlist(allowlist)).await;
+
+    let catalogue = json_of(&call(&client, "control_call", json!({"method": "engine.commands"})).await);
+    let ids: Vec<&str> = catalogue.as_array().expect("bare array shape is kept").iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["file.new", "layer.new.layer"], "{catalogue}");
+    // Same entries as `command_list`.
+    assert_eq!(catalogue, json_of(&call(&client, "command_list", json!({})).await));
+
+    bridge_requests_seen(client, app).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_control_call_other_command_methods_respect_allowlist() {
+    let (addr, app) = fake_app().await;
+    let allowlist = photocraft_automation::CommandAllowlist::parse("layer.*\nfile.new").unwrap();
+    let client = connect(PhotocraftMcp::bridge(&addr, CONTROL_TOKEN).unwrap().with_allowlist(allowlist)).await;
+    let refusal = photocraft_automation::allowlist::refusal("edit.undo");
+
+    let refused = [
+        ("ui.menu.invoke", json!({"id": "edit.undo"})),
+        ("ui.dialog.open", json!({"kind": "command", "command": "edit.undo"})),
+        ("ui.dialog.open", json!({"kind": "Command", "command": "edit.undo"})),
+        ("batch", json!({"steps": [{"command": "layer.new.layer"}, {"command": "edit.undo"}]})),
+        ("batch", json!({"steps": [{"method": "engine.execute", "params": {"command": "edit.undo"}}]})),
+        ("batch", json!({"steps": [{"method": "batch", "params": {"steps": [{"command": "edit.undo"}]}}]})),
+    ];
+    for (method, params) in refused {
+        let res = call(&client, "control_call", json!({"method": method, "params": params})).await;
+        assert_eq!(res.is_error, Some(true), "{method} {params}");
+        assert_eq!(text(&res), refusal, "{method} {params}");
+    }
+
+    // Allowed ids, non-command dialogs and unrelated methods still pass through.
+    let allowed = [
+        ("ui.menu.invoke", json!({"id": "layer.new.layer"})),
+        ("ui.dialog.open", json!({"kind": "command", "command": "file.new"})),
+        ("ui.dialog.open", json!({"kind": "about"})),
+        ("batch", json!({"steps": [{"command": "layer.new.layer"}, {"method": "ui.inspect"}]})),
+    ];
+    for (method, params) in allowed {
+        let res = call(&client, "control_call", json!({"method": method, "params": params})).await;
+        assert_ne!(res.is_error, Some(true), "{method} {params}: {}", text(&res));
+    }
+
+    let seen = bridge_requests_seen(client, app).await;
+    let methods: Vec<&str> = seen.iter().map(|request| request["method"].as_str().unwrap()).collect();
+    assert_eq!(methods, ["ui.menu.invoke", "ui.dialog.open", "ui.dialog.open", "batch"], "refused calls must not reach the bridge");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_ui_menu_invoke_respects_allowlist() {
+    let (addr, app) = fake_app().await;
+    let allowlist = photocraft_automation::CommandAllowlist::parse("layer.*\nfile.new").unwrap();
+    let client = connect(PhotocraftMcp::bridge(&addr, CONTROL_TOKEN).unwrap().with_allowlist(allowlist)).await;
+
+    let res = call(&client, "ui_menu_invoke", json!({"id": "edit.undo"})).await;
+    assert_eq!(res.is_error, Some(true));
+    assert_eq!(text(&res), photocraft_automation::allowlist::refusal("edit.undo"));
+
+    let res = json_of(&call(&client, "ui_menu_invoke", json!({"id": "layer.new.layer"})).await);
+    assert_eq!(res["invoked"], "layer.new.layer");
+
+    let seen = bridge_requests_seen(client, app).await;
+    assert_eq!(seen.len(), 1, "the refused call must not reach the bridge: {seen:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_control_call_is_unchanged_without_allowlist() {
+    let (addr, app) = fake_app().await;
+    let client = connect(PhotocraftMcp::bridge(&addr, CONTROL_TOKEN).unwrap()).await;
+
+    let res = json_of(&call(&client, "control_call", json!({"method": "engine.execute", "params": {"command": "edit.undo"}})).await);
+    assert_eq!(res["ran"], "edit.undo");
+    let res = json_of(&call(&client, "ui_menu_invoke", json!({"id": "edit.undo"})).await);
+    assert_eq!(res["invoked"], "edit.undo");
+    let catalogue = json_of(&call(&client, "control_call", json!({"method": "engine.commands"})).await);
+    assert_eq!(catalogue.as_array().map(Vec::len), Some(3), "{catalogue}");
+
+    let seen = bridge_requests_seen(client, app).await;
+    assert_eq!(seen.len(), 3, "{seen:?}");
+}
+
 #[test]
 fn command_allowlist_glob_and_file_parsing() {
     // Glob semantics: layer.* matches layer.new, not layers.x
@@ -1005,8 +1121,14 @@ async fn fake_app_with_screenshot(screenshot_png: Option<Vec<u8>>) -> (String, t
                 }
                 "app.save" => json!({"id": id, "ok": true, "result": {"saved": req["params"]}}),
                 "engine.commands" => {
-                    json!({"id": id, "ok": true, "result": [{"id": "file.new", "label": "New…", "enabled": true}]})
+                    json!({"id": id, "ok": true, "result": [
+                        {"id": "file.new", "label": "New…", "enabled": true},
+                        {"id": "edit.undo", "label": "Undo", "enabled": true},
+                        {"id": "layer.new.layer", "label": "New Layer", "enabled": true}
+                    ]})
                 }
+                "ui.menu.invoke" => json!({"id": id, "ok": true, "result": {"invoked": req["params"]["id"]}}),
+                "ui.dialog.open" | "batch" => json!({"id": id, "ok": true, "result": {"method": method, "params": req["params"]}}),
                 "ui.pointer" => json!({"id": id, "ok": true, "result": req["params"]}),
                 "ui.screenshot" => {
                     let bytes = screenshot_png.clone().unwrap_or_else(|| {

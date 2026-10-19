@@ -968,7 +968,12 @@ impl PhotocraftMcp {
     #[tool(description = "Bridge mode: activate a menu item by id.")]
     async fn ui_menu_invoke(&self, Parameters(p): Parameters<MenuParams>) -> Result<CallToolResult, McpError> {
         match self.bridge_client() {
-            Some(b) => to_result(b.call("ui.menu.invoke", json!({"id": p.id})).await),
+            Some(b) => {
+                if !self.is_command_allowed(&p.id) {
+                    return Ok(fail(crate::allowlist::refusal(&p.id)));
+                }
+                to_result(b.call("ui.menu.invoke", json!({"id": p.id})).await)
+            }
             None => bridge_only("ui_menu_invoke"),
         }
     }
@@ -986,7 +991,18 @@ impl PhotocraftMcp {
     #[tool(description = "Bridge mode: call any control-protocol method (docs/control-protocol.md) with raw params.")]
     async fn control_call(&self, Parameters(p): Parameters<ControlParams>) -> Result<CallToolResult, McpError> {
         match self.bridge_client() {
-            Some(b) => to_result(b.call(&p.method, p.params.unwrap_or_else(|| json!({}))).await),
+            Some(b) => {
+                let params = p.params.unwrap_or_else(|| json!({}));
+                if let Some(id) = self.control_rejected_command(&p.method, &params) {
+                    return Ok(fail(crate::allowlist::refusal(id)));
+                }
+                let reply = b.call(&p.method, params).await;
+                // The catalogue is narrowed like `command_list`; without `--commands` it passes through untouched.
+                if p.method == "engine.commands" && self.allowlist.is_some() {
+                    return to_result(reply.map(|catalogue| self.narrow_command_catalogue(catalogue)));
+                }
+                to_result(reply)
+            }
             None => bridge_only("control_call"),
         }
     }
@@ -997,6 +1013,50 @@ fn bridge_only_headless(name: &str) -> Result<CallToolResult, McpError> {
 }
 
 impl PhotocraftMcp {
+    /// The first command id a bridge control request would run that `--commands` rejects, if any.
+    ///
+    /// Covers the control methods that take a command id: `engine.execute` and `ui.menu.invoke` (the
+    /// app reads `command`, falling back to `id`), `ui.dialog.open` with kind `command`, and `batch`
+    /// steps (`{command}` or a nested `{method, params}`). Always `None` without `--commands`.
+    fn control_rejected_command<'a>(&self, method: &str, params: &'a Value) -> Option<&'a str> {
+        let text = |key: &str| params.get(key).and_then(Value::as_str);
+        let id = match method {
+            "engine.execute" | "ui.menu.invoke" => text("command").or_else(|| text("id")),
+            "ui.dialog.open" if matches!(text("kind"), Some("command" | "Command")) => text("command"),
+            "batch" => {
+                return params.get("steps")?.as_array()?.iter().find_map(|step| match step.get("command").and_then(Value::as_str) {
+                    Some(id) => (!self.is_command_allowed(id)).then_some(id),
+                    None => {
+                        let nested = step.get("method").and_then(Value::as_str)?;
+                        self.control_rejected_command(nested, step.get("params").unwrap_or(&Value::Null))
+                    }
+                });
+            }
+            _ => None,
+        };
+        id.filter(|id| !self.is_command_allowed(id))
+    }
+
+    /// Drop the commands `--commands` rejects from an `engine.commands` reply, keeping its shape
+    /// (a bare array or `{"commands": [...]}`). An unrecognised shape yields an empty list.
+    fn narrow_command_catalogue(&self, catalogue: Value) -> Value {
+        let keep = |entries: Vec<Value>| -> Vec<Value> {
+            entries.into_iter().filter(|c| self.is_command_allowed(c.get("id").and_then(Value::as_str).unwrap_or_default())).collect()
+        };
+        match catalogue {
+            Value::Array(entries) => Value::Array(keep(entries)),
+            Value::Object(mut fields) => {
+                let entries = match fields.remove("commands") {
+                    Some(Value::Array(entries)) => entries,
+                    _ => Vec::new(),
+                };
+                fields.insert("commands".to_string(), Value::Array(keep(entries)));
+                Value::Object(fields)
+            }
+            _ => Value::Array(Vec::new()),
+        }
+    }
+
     async fn run_command(&self, id: String, params: Value, wait: bool) -> Result<CallToolResult, McpError> {
         let (id2, params2) = (id.clone(), params.clone());
         if let Some(r) = self.headless_op(move |h| h.command_start(&id2, params2, wait)).await {
@@ -1090,6 +1150,15 @@ pub fn render_document_png(doc: &photocraft_doc::Document, max_side: u32) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn narrowing_an_engine_commands_reply_keeps_its_shape() {
+        let server = PhotocraftMcp::headless().with_allowlist(CommandAllowlist::parse("file.new").unwrap());
+        let entries = json!([{"id": "file.new"}, {"id": "edit.undo"}, {"label": "no id"}]);
+        assert_eq!(server.narrow_command_catalogue(entries.clone()), json!([{"id": "file.new"}]));
+        assert_eq!(server.narrow_command_catalogue(json!({"commands": entries, "total": 3})), json!({"commands": [{"id": "file.new"}], "total": 3}));
+        assert_eq!(server.narrow_command_catalogue(json!("junk")), json!([]));
+    }
 
     #[test]
     fn strict_schema_inlines_refs_and_stops_on_recursive_definitions() {
