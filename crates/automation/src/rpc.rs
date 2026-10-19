@@ -196,7 +196,7 @@ impl Headless {
             let r = if let Some(c) = str_of(s, "command") {
                 // Like `engine.execute`: `wait: false` starts a long command as a background job.
                 let wait = s.get("wait").and_then(Value::as_bool).unwrap_or(true);
-                if allow(c) { self.command_start(c, params, wait) } else { Err(bad(format!("command `{c}` is not allowed by `--commands`"))) }
+                if allow(c) { self.command_start(c, params, wait) } else { Err(bad(crate::allowlist::refusal(c))) }
             } else if let Some(m) = str_of(s, "method") {
                 if m == "batch" { Err(bad("nested batch")) } else { self.handle(m, params) }
             } else {

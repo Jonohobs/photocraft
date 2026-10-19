@@ -12,7 +12,7 @@ enum AllowPattern {
 }
 
 /// A parsed allowlist of command ids and prefix globs.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandAllowlist {
     patterns: Vec<AllowPattern>,
 }
@@ -66,7 +66,7 @@ impl CommandAllowlist {
             return Err(format!("{name}: allowlist exceeds {MAX_ALLOWLIST_BYTES} bytes"));
         }
         let text = String::from_utf8(bytes).map_err(|_| format!("{name}: not valid UTF-8"))?;
-        Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+        Self::parse(&text).map_err(|e| format!("{name}: {e}"))
     }
 
     /// Check if a command id is permitted by this allowlist.
@@ -76,6 +76,11 @@ impl CommandAllowlist {
             AllowPattern::Prefix(prefix) => command_id.starts_with(prefix),
         })
     }
+}
+
+/// The error every gated surface returns for a command the allowlist excludes.
+pub fn refusal(command_id: &str) -> String {
+    format!("command `{command_id}` is not allowed by `--commands`")
 }
 
 #[cfg(test)]

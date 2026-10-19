@@ -488,10 +488,7 @@ impl PhotocraftMcp {
         self
     }
 
-    pub fn allowlist(&self) -> Option<&CommandAllowlist> {
-        self.allowlist.as_deref()
-    }
-
+    /// Whether `id` may be listed or run: always true without `--commands`.
     pub fn is_command_allowed(&self, id: &str) -> bool {
         match &self.allowlist {
             Some(allowlist) => allowlist.allows(id),
@@ -859,7 +856,7 @@ impl PhotocraftMcp {
         then they run as a background job and the result is {job: id} (see jobs_list, jobs_cancel).")]
     async fn command_run(&self, Parameters(p): Parameters<RunParams>) -> Result<CallToolResult, McpError> {
         if !self.is_command_allowed(&p.id) {
-            return Ok(fail(format!("command `{}` is not allowed by `--commands`", p.id)));
+            return Ok(fail(crate::allowlist::refusal(&p.id)));
         }
         self.run_command(p.id, p.params.unwrap_or_else(|| json!({})), p.wait.unwrap_or(true)).await
     }
@@ -903,7 +900,7 @@ impl PhotocraftMcp {
         for s in &steps {
             let cmd_id = s.get("command").and_then(Value::as_str).unwrap_or_default();
             let (was_error, result) = if !self.is_command_allowed(cmd_id) {
-                (true, json!({"ok": false, "error": format!("command `{cmd_id}` is not allowed by `--commands`")}))
+                (true, json!({"ok": false, "error": crate::allowlist::refusal(cmd_id)}))
             } else {
                 let response = b.call("engine.execute", s.clone()).await;
                 let was_err = response.is_err();
